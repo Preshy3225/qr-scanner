@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>QR Scanner</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: Arial, sans-serif;
+            background: #f1f5f9;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .scanner-container {
+            width: 100%;
+            max-width: 520px;
+            background: #ffffff;
+            border-radius: 16px;
+            padding: 20px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+        }
+
+        .scanner-header {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+
+        .scanner-header h1 {
+            margin: 0 0 8px;
+            font-size: 24px;
+        }
+
+        .scanner-header p {
+            margin: 0;
+            color: #64748b;
+        }
+
+        .video-wrapper {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 4 / 3;
+            background: #000;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        #qr-video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        .scan-frame {
+            position: absolute;
+            width: 65%;
+            aspect-ratio: 1;
+            border: 3px solid #2ecc71;
+            border-radius: 12px;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+        }
+
+        .status {
+            margin-top: 15px;
+            padding: 12px;
+            border-radius: 8px;
+            background: #f8fafc;
+            text-align: center;
+            color: #475569;
+        }
+
+        .buttons {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        button {
+            flex: 1;
+            padding: 13px;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        #startScan {
+            background: #2ecc71;
+            color: white;
+        }
+
+        #stopScan {
+            background: #dc2626;
+            color: white;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .result {
+            margin-top: 15px;
+            padding: 12px;
+            border-radius: 8px;
+            background: #ecfdf5;
+            color: #166534;
+            display: none;
+            word-break: break-all;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="scanner-container">
+
+    <div class="scanner-header">
+        <h1>QR Scanner</h1>
+        <p>Position the QR code inside the frame</p>
+    </div>
+
+    <div class="video-wrapper">
+
+        <video
+            id="qr-video"
+            autoplay
+            muted
+            playsinline>
+        </video>
+
+        <div class="scan-frame"></div>
+
+    </div>
+
+    <div
+        id="status"
+        class="status">
+        Scanner ready.
+    </div>
+
+    <div class="buttons">
+
+        <button
+            id="startScan">
+            Start Scanner
+        </button>
+
+        <button
+            id="stopScan"
+            disabled>
+            Stop Scanner
+        </button>
+
+    </div>
+
+    <div
+        id="result"
+        class="result">
+    </div>
+
+</div>
+
+<canvas
+    id="qr-canvas"
+    style="display:none;">
+</canvas>
+
+
+<!-- Local jsQR library -->
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+
+
+<script>
+
+const scanner = {
+
+    video: document.getElementById('qr-video'),
+
+    canvas: document.getElementById('qr-canvas'),
+
+    ctx: document
+        .getElementById('qr-canvas')
+        .getContext('2d', {
+            willReadFrequently: true
+        }),
+
+    startButton:
+        document.getElementById('startScan'),
+
+    stopButton:
+        document.getElementById('stopScan'),
+
+    status:
+        document.getElementById('status'),
+
+    result:
+        document.getElementById('result'),
+
+    stream: null,
+
+    scanning: false,
+
+    processing: false,
+
+    animationFrame: null,
+
+    lastCode: null,
+
+    lastScanTime: 0
+
+};
+
+
+/**
+ * START CAMERA
+ */
+async function startScanner() {
+
+    if (scanner.scanning) {
+        return;
+    }
+
+    try {
+
+        scanner.status.textContent =
+            'Requesting camera permission...';
+
+        scanner.result.style.display = 'none';
+
+
+        if (
+            !navigator.mediaDevices ||
+            !navigator.mediaDevices.getUserMedia
+        ) {
+
+            throw new Error(
+                'Camera API is not available in this browser.'
+            );
+
+        }
+
+
+        const stream =
+            await navigator.mediaDevices.getUserMedia({
+
+                video: {
+
+                    facingMode: {
+                        ideal: 'environment'
+                    },
+
+                    width: {
+                        ideal: 1280
+                    },
+
+                    height: {
+                        ideal: 720
+                    }
+
+                },
+
+                audio: false
+
+            });
+
+
+        scanner.stream = stream;
+
+        scanner.video.srcObject = stream;
+
+        scanner.scanning = true;
+
+        scanner.processing = false;
+
+        scanner.lastCode = null;
+
+
+        scanner.startButton.disabled = true;
+
+        scanner.stopButton.disabled = false;
+
+
+        scanner.status.textContent =
+            'Camera active — scanning...';
+
+
+        await scanner.video.play();
+
+
+        scanner.animationFrame =
+            requestAnimationFrame(scanQRCode);
+
+
+        console.log(
+            'QR Scanner started successfully.'
+        );
+
+
+    } catch (error) {
+
+        console.error(
+            'Camera access error:',
+            error
+        );
+
+        scanner.status.textContent =
+            getCameraErrorMessage(error);
+
+    }
+
+}
+
+
+/**
+ * QR SCANNING LOOP
+ */
+function scanQRCode() {
+
+    if (!scanner.scanning) {
+        return;
+    }
+
+
+    const video = scanner.video;
+
+
+    if (
+        video.readyState >=
+        HTMLMediaElement.HAVE_ENOUGH_DATA
+    ) {
+
+        if (
+            video.videoWidth > 0 &&
+            video.videoHeight > 0
+        ) {
+
+            scanner.canvas.width =
+                video.videoWidth;
+
+            scanner.canvas.height =
+                video.videoHeight;
+
+
+            scanner.ctx.drawImage(
+                video,
+                0,
+                0,
+                scanner.canvas.width,
+                scanner.canvas.height
+            );
+
+
+            const imageData =
+                scanner.ctx.getImageData(
+                    0,
+                    0,
+                    scanner.canvas.width,
+                    scanner.canvas.height
+                );
+
+
+            const code = jsQR(
+                imageData.data,
+                imageData.width,
+                imageData.height,
+                {
+                    inversionAttempts:
+                        'dontInvert'
+                }
+            );
+
+
+            if (code && !scanner.processing) {
+
+                handleQRCode(code.data);
+
+            }
+
+        }
+
+    }
+
+
+    scanner.animationFrame =
+        requestAnimationFrame(scanQRCode);
+
+}
+
+
+/**
+ * HANDLE QR CODE
+ */
+function handleQRCode(code) {
+
+    if (!code) {
+        return;
+    }
+
+
+    const now = Date.now();
+
+
+    /*
+     * Prevent the same QR code from
+     * firing repeatedly.
+     */
+    if (
+        scanner.lastCode === code &&
+        now - scanner.lastScanTime < 3000
+    ) {
+
+        return;
+
+    }
+
+
+    scanner.lastCode = code;
+
+    scanner.lastScanTime = now;
+
+    scanner.processing = true;
+
+
+    console.log(
+        'QR Code detected:',
+        code
+    );
+
+
+    scanner.status.textContent =
+        'QR code detected. Sending...';
+
+
+    scanner.result.textContent =
+        code;
+
+    scanner.result.style.display =
+        'block';
+
+
+    /*
+     * Send QR code to the
+     * Admin Dashboard.
+     */
+    sendQRCodeToDashboard(code);
+
+
+    /*
+     * Allow another scan after
+     * a short delay.
+     */
+    setTimeout(function () {
+
+        scanner.processing = false;
+
+        if (scanner.scanning) {
+
+            scanner.status.textContent =
+                'Camera active — scanning...';
+
+        }
+
+    }, 1500);
+
+}
+
+
+/**
+ * SEND QR CODE TO DASHBOARD
+ */
+function sendQRCodeToDashboard(code) {
+
+    if (!window.opener) {
+
+        console.warn(
+            'Scanner was not opened by the Admin Dashboard.'
+        );
+
+        scanner.status.textContent =
+            'QR detected, but no Admin Dashboard is connected.';
+
+        return;
+
+    }
+
+
+    window.opener.postMessage({
+
+        type: 'QR_SCANNED',
+
+        code: code
+
+    }, '*');
+
+}
+
+
+/**
+ * STOP CAMERA
+ */
+function stopScanner() {
+
+    scanner.scanning = false;
+
+    scanner.processing = false;
+
+
+    if (scanner.animationFrame) {
+
+        cancelAnimationFrame(
+            scanner.animationFrame
+        );
+
+        scanner.animationFrame = null;
+
+    }
+
+
+    if (scanner.stream) {
+
+        scanner.stream
+            .getTracks()
+            .forEach(function(track) {
+
+                track.stop();
+
+            });
+
+        scanner.stream = null;
+
+    }
+
+
+    scanner.video.srcObject = null;
+
+
+    scanner.startButton.disabled = false;
+
+    scanner.stopButton.disabled = true;
+
+
+    scanner.status.textContent =
+        'Scanner stopped.';
+
+}
+
+
+/**
+ * CAMERA ERROR MESSAGE
+ */
+function getCameraErrorMessage(error) {
+
+    switch (error.name) {
+
+        case 'NotAllowedError':
+            return 'Camera permission was denied. Please allow camera access.';
+
+        case 'NotFoundError':
+            return 'No camera was found on this device.';
+
+        case 'NotReadableError':
+            return 'The camera is already being used by another application.';
+
+        case 'OverconstrainedError':
+            return 'The requested camera configuration is not available.';
+
+        case 'SecurityError':
+            return 'Camera access was blocked by the browser security policy.';
+
+        default:
+            return 'Unable to access the camera: ' +
+                error.message;
+
+    }
+
+}
+
+
+/**
+ * BUTTON EVENTS
+ */
+scanner.startButton.addEventListener(
+    'click',
+    startScanner
+);
+
+
+scanner.stopButton.addEventListener(
+    'click',
+    stopScanner
+);
+
+
+/**
+ * CLEAN UP WHEN WINDOW CLOSES
+ */
+window.addEventListener(
+    'beforeunload',
+    stopScanner
+);
+
+</script>
+
+</body>
+</html>
