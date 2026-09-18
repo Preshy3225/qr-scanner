@@ -489,30 +489,70 @@ function handleQRCode(code) {
 /**
  * SEND QR CODE TO DASHBOARD
  */
-function sendQRCodeToDashboard(code) {
+// ── Read relay config from the URL ──────────────────────
+var _relayBase = null;
+var _relaySession = null;
 
-    if (!window.opener) {
-
-        console.warn(
-            'Scanner was not opened by the Admin Dashboard.'
-        );
-
-        scanner.status.textContent =
-            'QR detected, but no Admin Dashboard is connected.';
-
-        return;
-
+(function readRelayConfig() {
+    try {
+        var params = new URLSearchParams(window.location.search);
+        _relayBase = params.get('relay') || '';
+        _relaySession = params.get('session') || '';
+    } catch (e) {
+        console.warn('Could not parse scanner URL params:', e);
     }
 
+    if (!_relayBase || !_relaySession) {
+        console.warn('Scanner started without relay config. Codes will be shown but not sent.');
+    } else {
+        console.log('Scanner relay configured. Session:', _relaySession);
+    }
+})();
 
-    window.opener.postMessage({
+function sendQRCodeToDashboard(code) {
+    if (!code) return;
 
-        type: 'QR_SCANNED',
+    // ── Path A: postMessage (rarely works inside Apps Script sandbox) ──
+    var openerSent = false;
+    try {
+        if (window.opener && !window.opener.closed) {
+            window.opener.postMessage({ type: 'QR_SCANNED', code: code }, '*');
+            openerSent = true;
+        }
+    } catch (e) {
+        console.warn('postMessage to opener failed:', e);
+    }
 
-        code: code
+    // ── Path B: HTTP relay (the one that actually works) ──
+    if (_relayBase && _relaySession) {
+        var url = _relayBase +
+                  '?page=scanner-relay' +
+                  '&session=' + encodeURIComponent(_relaySession) +
+                  '&code=' + encodeURIComponent(code);
 
-    }, '*');
+        // Fire and forget. We don't need the response.
+        fetch(url, { mode: 'no-cors', cache: 'no-store' })
+            .then(function() {
+                scanner.status.textContent =
+                    'Sent to dashboard. Ready for next scan.';
+            })
+            .catch(function(err) {
+                console.error('Relay fetch failed:', err);
+                scanner.status.textContent =
+                    'Failed to reach dashboard. Check your connection.';
+            });
 
+        return;
+    }
+
+    // ── Fallback: no relay configured ──
+    if (openerSent) {
+        scanner.status.textContent = 'Sent to dashboard. Ready for next scan.';
+    } else {
+        scanner.status.textContent =
+            'QR captured, but no dashboard is connected. ' +
+            'Please scan from within the Admin Dashboard.';
+    }
 }
 
 
