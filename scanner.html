@@ -191,6 +191,35 @@
             line-height: 1.4;
         }
 
+        .camera-stop-btn {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            display: none;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            background: rgba(15, 23, 42, 0.85);
+            color: #f8fafc;
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 9999px;
+            font-size: 12px;
+            font-weight: 600;
+            font-family: inherit;
+            cursor: pointer;
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+        }
+
+        .camera-stop-btn:hover {
+            background: rgba(220, 38, 38, 0.85);
+            border-color: rgba(220, 38, 38, 0.5);
+        }
+
+        .camera-wrap.camera-on .camera-stop-btn {
+            display: inline-flex;
+        }
+
         /* ── MANUAL ENTRY ─────────────────────────────────────── */
         .manual-section {
             margin: 14px;
@@ -547,12 +576,18 @@
     <div class="camera-wrap" id="cameraWrap">
         <video id="qr-video" autoplay muted playsinline></video>
         <div class="scan-frame" id="scanFrame" style="display:none;"></div>
-        <div class="camera-status" id="cameraStatus">Initialising…</div>
+        <div class="camera-status" id="cameraStatus" style="display:none;">Scanning…</div>
 
+        <!-- Camera OFF state -->
         <button class="camera-start-btn" id="startCameraBtn" onclick="startCamera()">
             <i class="fas fa-camera"></i>
-            <span>Tap to start camera</span>
-            <small>Allow camera access when prompted</small>
+            <span>Turn on camera</span>
+            <small>Use this only if the attendee has a QR code</small>
+        </button>
+
+        <!-- Camera ON state — small "turn off" button, top-right -->
+        <button class="camera-stop-btn" id="stopCameraBtn" onclick="stopCameraManually()" title="Turn off camera">
+            <i class="fas fa-power-off"></i> Turn off
         </button>
     </div>
 
@@ -569,7 +604,7 @@
                 autocomplete="off"
                 spellcheck="false"></textarea>
             <button class="manual-submit" id="manualSubmit" onclick="submitManual()">
-                <i class="fas fa-paper-plane"></i> Send
+                <i class="fas fa-check"></i> Validate
             </button>
         </div>
         <div class="manual-hint" id="manualHint">
@@ -649,6 +684,8 @@
         // Timers
         resultPollTimer: null,
         bannerTimer:     null,
+        idleTimer:       null,
+        idleTimeoutMs:   60000,   // 60 seconds
 
         // Audio context (lazy)
         audioCtx:   null
@@ -697,7 +734,7 @@
 
         // ── Manual hint ──
         document.getElementById('manualHint').textContent =
-            'One code per line, up to ' + S.maxBatch + ' at a time.';
+            'Type a code below, or turn on the camera. Up to ' + S.maxBatch + ' per batch.';
 
         // ── Warn on close ──
         window.addEventListener('beforeunload', stopCamera);
@@ -717,6 +754,88 @@
             }
         });
     })();
+
+        // ============================================================
+    // TOAST (lightweight, non-blocking)
+    // ============================================================
+    var _toastTimeout = null;
+
+    function showToast(message, kind) {
+        kind = kind || 'info';
+
+        var t = document.getElementById('scannerToast');
+        if (!t) {
+            t = document.createElement('div');
+            t.id = 'scannerToast';
+            t.style.cssText = [
+                'position:fixed',
+                'top:14px',
+                'left:50%',
+                'transform:translateX(-50%) translateY(-100px)',
+                'padding:10px 20px',
+                'border-radius:9999px',
+                'font-size:13px',
+                'font-weight:600',
+                'color:#ffffff',
+                'z-index:10001',
+                'transition:transform 0.25s ease, opacity 0.25s ease',
+                'opacity:0',
+                'max-width:calc(100vw - 28px)',
+                'text-align:center',
+                'pointer-events:none',
+                'box-shadow:0 10px 30px rgba(0,0,0,0.3)'
+            ].join(';');
+            document.body.appendChild(t);
+        }
+
+        var bg = {
+            success: '#16a34a',
+            error:   '#dc2626',
+            warning: '#f59e0b',
+            info:    '#2563eb'
+        }[kind] || '#2563eb';
+
+        t.style.background = bg;
+        t.textContent = message;
+
+        requestAnimationFrame(function() {
+            t.style.transform = 'translateX(-50%) translateY(0)';
+            t.style.opacity = '1';
+        });
+
+        if (_toastTimeout) clearTimeout(_toastTimeout);
+        _toastTimeout = setTimeout(function() {
+            t.style.transform = 'translateX(-50%) translateY(-100px)';
+            t.style.opacity = '0';
+        }, 3000);
+    }
+
+    // ============================================================
+    // IDLE AUTO-OFF
+    // Turn the camera off after 60s of no scan, to save battery
+    // when the officer has walked away or is typing codes instead.
+    // ============================================================
+    function resetIdleTimer() {
+        if (S.idleTimer) {
+            clearTimeout(S.idleTimer);
+            S.idleTimer = null;
+        }
+
+        // Only arm if the camera is currently on
+        if (!S.scanning) return;
+
+        S.idleTimer = setTimeout(function() {
+            if (!S.scanning) return;   // already off
+            stopCamera({ auto: true });
+        }, S.idleTimeoutMs);
+    }
+
+    function clearIdleTimer() {
+        if (S.idleTimer) {
+            clearTimeout(S.idleTimer);
+            S.idleTimer = null;
+        }
+    }
 
     // ============================================================
     // FATAL ERROR
@@ -745,8 +864,10 @@
 
         var btn = document.getElementById('startCameraBtn');
         var status = document.getElementById('cameraStatus');
+        var wrap = document.getElementById('cameraWrap');
 
         try {
+            status.style.display = 'block';
             status.textContent = 'Requesting camera permission…';
 
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -772,21 +893,30 @@
 
             btn.style.display = 'none';
             document.getElementById('scanFrame').style.display = 'block';
+            wrap.classList.add('camera-on');
             status.textContent = 'Scanning…';
 
             S.rafId = requestAnimationFrame(scanLoop);
+
+            // Start the idle countdown
+            resetIdleTimer();
+
         } catch (err) {
             console.error('[camera] error:', err);
             status.textContent = friendlyCameraError(err);
-            // Leave the start button visible so the user can retry
             btn.querySelector('span').textContent = 'Retry camera';
             btn.querySelector('small').textContent = friendlyCameraError(err);
         }
     }
 
-    function stopCamera() {
+    function stopCamera(opts) {
+        opts = opts || {};
+        var wasScanning = S.scanning;
+
         S.scanning = false;
         S.processing = false;
+
+        clearIdleTimer();
 
         if (S.rafId) {
             cancelAnimationFrame(S.rafId);
@@ -800,6 +930,30 @@
 
         var video = document.getElementById('qr-video');
         if (video) video.srcObject = null;
+
+        // Restore UI to the "camera off" state
+        var btn = document.getElementById('startCameraBtn');
+        var wrap = document.getElementById('cameraWrap');
+        var status = document.getElementById('cameraStatus');
+        var scanFrame = document.getElementById('scanFrame');
+
+        if (btn) {
+            btn.style.display = 'flex';
+            btn.querySelector('span').textContent = 'Turn on camera';
+            btn.querySelector('small').textContent = 'Use this only if the attendee has a QR code';
+        }
+        if (scanFrame) scanFrame.style.display = 'none';
+        if (status) status.style.display = 'none';
+        if (wrap) wrap.classList.remove('camera-on');
+
+        // If auto-turned-off, tell the officer why
+        if (opts.auto && wasScanning) {
+            showToast('Camera turned off after 60 seconds of inactivity.', 'info');
+        }
+    }
+
+    function stopCameraManually() {
+        stopCamera({ auto: false });
     }
 
     function friendlyCameraError(err) {
@@ -846,6 +1000,9 @@
         S.lastCode = code;
         S.lastAt = now;
         S.processing = true;
+
+        // Officer is active — reset the idle countdown
+        resetIdleTimer();
 
         // Brief visual acknowledgement
         document.getElementById('cameraStatus').textContent = 'Processing…';
@@ -906,7 +1063,7 @@
 
     function flashManualHint(text, kind) {
         var hint = document.getElementById('manualHint');
-        var original = 'One code per line, up to ' + S.maxBatch + ' at a time.';
+        var original = 'Type a code below, or turn on the camera. Up to ' + S.maxBatch + ' per batch.';
         hint.textContent = text;
         hint.style.color = kind === 'ok' ? '#4ade80' : '#fbbf24';
         setTimeout(function() {
@@ -914,7 +1071,7 @@
             hint.style.color = '';
         }, 2200);
     }
-
+        
     // ============================================================
     // RELAY PUSH (camera + manual)
     // ============================================================
