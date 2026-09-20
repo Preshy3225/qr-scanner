@@ -1007,15 +1007,16 @@
         // Brief visual acknowledgement
         document.getElementById('cameraStatus').textContent = 'Processing…';
 
-        pushToRelay({ code: code });
-
-        // Re-arm after a short cooldown
-        setTimeout(function() {
-            S.processing = false;
-            if (S.scanning) {
-                document.getElementById('cameraStatus').textContent = 'Scanning…';
-            }
-        }, 1400);
+        // Single-round-trip validation. Fallback to relay if it fails.
+        validateDirect(code, 'camera').finally(function() {
+            // Keep the cooldown so we don't double-fire the same QR
+            setTimeout(function() {
+                S.processing = false;
+                if (S.scanning) {
+                    document.getElementById('cameraStatus').textContent = 'Scanning…';
+                }
+            }, 900);
+        });
     }
 
     // ============================================================
@@ -1047,20 +1048,32 @@
             return;
         }
 
-        // Push each code
-        codes.forEach(function(c) {
-            pushToRelay({ manual: c });
-        });
-
         el.value = '';
-        flashManualHint(
-            codes.length === 1
-                ? 'Sent 1 code for validation.'
-                : 'Sent ' + codes.length + ' codes for validation.',
-            'ok'
-        );
-    }
 
+        if (codes.length === 1) {
+            // Single code — show a processing banner immediately
+            flashManualHint('Validating…', 'ok');
+            validateDirect(codes[0], 'manual').then(function() {
+                flashManualHint('Validated.', 'ok');
+            });
+            return;
+        }
+
+        // Batch — fire sequentially so results arrive in order
+        flashManualHint('Validating ' + codes.length + ' codes…', 'ok');
+
+        var i = 0;
+        function next() {
+            if (i >= codes.length) {
+                flashManualHint('Batch complete (' + codes.length + ' codes).', 'ok');
+                return;
+            }
+            var c = codes[i++];
+            validateDirect(c, 'manual').then(next, next);
+        }
+        next();
+    }
+        
     function flashManualHint(text, kind) {
         var hint = document.getElementById('manualHint');
         var original = 'Type a code below, or turn on the camera. Up to ' + S.maxBatch + ' per batch.';
@@ -1091,6 +1104,52 @@
             .catch(function(err) {
                 console.warn('[relay push] failed:', err);
             });
+    }
+
+    // ============================================================
+    // DIRECT VALIDATION — single round-trip
+    // Posts the code to the backend and returns the result inline.
+    // Fallback to relay push if the direct call fails.
+    // ============================================================
+    function validateDirect(code, source) {
+      // source = 'camera' | 'manual' — used only for logging/UI
+      return fetch(S.relayBase, {
+        method: 'POST',
+        // text/plain avoids CORS preflight for simple POST
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          action:  'validate',
+          code:    code,
+          mode:    S.mode,
+          session: S.sessionId
+        }),
+        cache: 'no-store'
+      })
+        .then(function(res) {
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          return res.json();
+        })
+        .then(function(data) {
+          if (!data || !data.success || !data.result) {
+            throw new Error('No result in response');
+          }
+          // Feed it through the same handler the relay-polling path uses
+          handleResult(data.result);
+          return data.result;
+        })
+        .catch(function(err) {
+          console.warn('[validateDirect] failed, falling back to relay:', err);
+    
+          // Fallback: push via relay so the dashboard can pick it up
+          if (source === 'camera') {
+            pushToRelay({ code: code });
+          } else if (source === 'manual') {
+            pushToRelay({ manual: code });
+          }
+    
+          // Show a soft warning so the officer knows we degraded
+          showToast('Direct call failed — using dashboard relay.', 'warning');
+        });
     }
 
     // ============================================================
