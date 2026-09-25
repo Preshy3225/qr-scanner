@@ -668,6 +668,11 @@
         eventName:  '',
          csrfNonce:  '',    
 
+        // ── NEW: race-avoidance flags ──
+        _validating:        false,   // true while a POST is in flight
+        _nonceRetried:      false,   // true after one retry attempt
+        _nonceRejectStreak: 0,       // consecutive poll rejections
+
         // Runtime
         scanning:   false,
         processing: false,
@@ -1127,6 +1132,11 @@
     // Fallback to relay push if the direct call fails.
     // ============================================================
     function validateDirect(code, source) {
+      // Pause polling while this POST is in flight. This
+      // eliminates the race where a poll fires with the old
+      // nonce just after the POST rotated it.
+      S._validating = true;
+
       return fetch(S.relayBase, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
@@ -1144,10 +1154,57 @@
           return res.json();
         })
         .then(function(data) {
+          // ── Update nonce from the response ──
+          // Do this FIRST, before any checks, so the next
+          // request (whatever it is) uses the latest nonce.
+          if (data && data.csrfNonce) {
+            S.csrfNonce = data.csrfNonce;
+          }
+
           if (!data || !data.success || !data.result) {
-            // Was it a nonce rejection?
+            // Check for nonce rejection
             if (data && data.result && data.result.message &&
                 data.result.message.indexOf('Invalid session credentials') !== -1) {
+
+              // Retry ONCE with the new nonce. This handles the
+              // case where a concurrent poll consumed our nonce
+              // before our POST arrived.
+              if (!S._nonceRetried) {
+                S._nonceRetried = true;
+                return fetch(S.relayBase, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                  body: JSON.stringify({
+                    action:  'validate',
+                    code:    code,
+                    mode:    S.mode,
+                    session: S.sessionId,
+                    nonce:   S.csrfNonce
+                  }),
+                  cache: 'no-store'
+                })
+                  .then(function(res) { return res.json(); })
+                  .then(function(retryData) {
+                    S._nonceRetried = false;
+                    if (retryData && retryData.csrfNonce) {
+                      S.csrfNonce = retryData.csrfNonce;
+                    }
+                    if (retryData && retryData.success && retryData.result) {
+                      handleResult(retryData.result);
+                      return retryData.result;
+                    }
+                    // Retry also failed → real problem
+                    stopCamera();
+                    stopResultPolling();
+                    showFatal(
+                      'Session Hijacked',
+                      'Someone else is using this scanner session. Please close this window and start a new scanner from the dashboard.'
+                    );
+                    throw new Error('NONCE_REJECTED');
+                  });
+              }
+
+              // Already retried once — give up
               stopCamera();
               stopResultPolling();
               showFatal(
@@ -1159,18 +1216,13 @@
             throw new Error('No result in response');
           }
 
-          // ── Pick up the rotated nonce ──
-          if (data.csrfNonce) {
-            S.csrfNonce = data.csrfNonce;
-          }
-
+          // ── Success ──
           handleResult(data.result);
           return data.result;
         })
         .catch(function(err) {
           if (err && err.message === 'NONCE_REJECTED') {
-            // Already handled — do not fall back
-            return;
+            return;   // Already handled
           }
 
           console.warn('[validateDirect] failed, falling back to relay:', err);
@@ -1182,6 +1234,10 @@
           }
 
           showToast('Direct call failed — using dashboard relay.', 'warning');
+        })
+        .finally(function() {
+          // Resume polling
+          S._validating = false;
         });
     }
 
@@ -1204,6 +1260,11 @@
         if (document.hidden) return;
         if (!S.csrfNonce) return;
 
+        // Skip polls while a direct validation is in flight.
+        // This eliminates the race where a poll fires with a
+        // stale nonce during the POST round-trip.
+        if (S._validating) return;
+
         var url = S.relayBase + '?page=scanner-relay' +
                   '&session=' + encodeURIComponent(S.sessionId) +
                   '&nonce=' + encodeURIComponent(S.csrfNonce) +
@@ -1214,8 +1275,18 @@
             .then(function(data) {
                 if (!data) return;
 
-                // Nonce rejected → someone else is using this session
+                // ── Nonce rejected ──
+                // Could be a race with a concurrent POST. Count
+                // consecutive rejections; only show fatal after 3.
                 if (data.ok === false && data.error === 'INVALID_NONCE') {
+                    S._nonceRejectStreak = (S._nonceRejectStreak || 0) + 1;
+
+                    if (S._nonceRejectStreak < 3) {
+                        // Transient — the next poll may succeed
+                        // because the POST will have updated our nonce.
+                        return;
+                    }
+
                     stopResultPolling();
                     stopCamera();
                     showFatal(
@@ -1224,6 +1295,9 @@
                     );
                     return;
                 }
+
+                // Successful poll → reset the streak
+                S._nonceRejectStreak = 0;
 
                 if (data.expired || data.ended) {
                     stopResultPolling();
@@ -1345,13 +1419,10 @@
             .then(function(data) {
                 if (!data) return;
 
+                // Nonce rejected — this is a startup call, and a
+                // single rejection during startup is harmless. Do
+                // NOT show fatal here.
                 if (data.ok === false && data.error === 'INVALID_NONCE') {
-                    stopResultPolling();
-                    stopCamera();
-                    showFatal(
-                        'Session Hijacked',
-                        'Someone else is using this scanner session. Please close this window and start a new scanner from the dashboard.'
-                    );
                     return;
                 }
 
@@ -1361,7 +1432,7 @@
 
                 if (!data.ok || !Array.isArray(data.log)) return;
 
-                // Rebuild in-memory log from history
+                // ... rest of function unchanged
                 data.log.forEach(function(row) {
                     S.log.push({
                         success: !!row.success,
@@ -1374,9 +1445,7 @@
                     if (row.success) S.okCount++; else S.badCount++;
                 });
 
-                // Newest first
                 S.log.reverse();
-
                 renderLog();
 
                 if (S.log.length > 0) {
