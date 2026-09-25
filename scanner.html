@@ -666,6 +666,7 @@
         mode:       'registration',   // 'registration' | 'food'
         maxBatch:   10,
         eventName:  '',
+         csrfNonce:  '',    
 
         // Runtime
         scanning:   false,
@@ -702,6 +703,7 @@
             S.mode      = (qs.get('mode') || 'registration').toLowerCase();
             S.maxBatch  = parseInt(qs.get('maxBatch'), 10) || 10;
             S.eventName = qs.get('eventName') || '';
+            S.csrfNonce = qs.get('nonce') || '';
         } catch (e) {
             console.error('[boot] could not parse URL:', e);
         }
@@ -710,6 +712,14 @@
             showFatal(
                 'Invalid Scanner Link',
                 'This scanner must be opened from the Admin Dashboard. Please close this window and try again from the dashboard.'
+            );
+            return;
+        }
+
+        if (!S.csrfNonce) {
+            showFatal(
+                'Invalid Scanner Link',
+                'This scanner URL is missing its security token. Please close this window and start the scanner again from the Admin Dashboard.'
             );
             return;
         }
@@ -1090,7 +1100,8 @@
     // ============================================================
     function pushToRelay(params) {
         var url = S.relayBase + '?page=scanner-relay' +
-                  '&session=' + encodeURIComponent(S.sessionId);
+                  '&session=' + encodeURIComponent(S.sessionId) +
+                  '&nonce=' + encodeURIComponent(S.csrfNonce);
 
         if (params.code) {
             url += '&code=' + encodeURIComponent(params.code);
@@ -1099,7 +1110,11 @@
             url += '&manual=' + encodeURIComponent(params.manual);
         }
 
-        // Fire and forget — we don't need the response
+        // Fire and forget — no need to read the response.
+        // We use `no-cors` because we only care about the
+        // request reaching the server, not about the reply.
+        // The nonce rotation is picked up via the next
+        // poll_result or poll_log call.
         fetch(url, { mode: 'no-cors', cache: 'no-store' })
             .catch(function(err) {
                 console.warn('[relay push] failed:', err);
@@ -1112,16 +1127,15 @@
     // Fallback to relay push if the direct call fails.
     // ============================================================
     function validateDirect(code, source) {
-      // source = 'camera' | 'manual' — used only for logging/UI
       return fetch(S.relayBase, {
         method: 'POST',
-        // text/plain avoids CORS preflight for simple POST
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify({
           action:  'validate',
           code:    code,
           mode:    S.mode,
-          session: S.sessionId
+          session: S.sessionId,
+          nonce:   S.csrfNonce
         }),
         cache: 'no-store'
       })
@@ -1131,23 +1145,42 @@
         })
         .then(function(data) {
           if (!data || !data.success || !data.result) {
+            // Was it a nonce rejection?
+            if (data && data.result && data.result.message &&
+                data.result.message.indexOf('Invalid session credentials') !== -1) {
+              stopCamera();
+              stopResultPolling();
+              showFatal(
+                'Session Hijacked',
+                'Someone else is using this scanner session. Please close this window and start a new scanner from the dashboard.'
+              );
+              throw new Error('NONCE_REJECTED');
+            }
             throw new Error('No result in response');
           }
-          // Feed it through the same handler the relay-polling path uses
+
+          // ── Pick up the rotated nonce ──
+          if (data.csrfNonce) {
+            S.csrfNonce = data.csrfNonce;
+          }
+
           handleResult(data.result);
           return data.result;
         })
         .catch(function(err) {
+          if (err && err.message === 'NONCE_REJECTED') {
+            // Already handled — do not fall back
+            return;
+          }
+
           console.warn('[validateDirect] failed, falling back to relay:', err);
-    
-          // Fallback: push via relay so the dashboard can pick it up
+
           if (source === 'camera') {
             pushToRelay({ code: code });
           } else if (source === 'manual') {
             pushToRelay({ manual: code });
           }
-    
-          // Show a soft warning so the officer knows we degraded
+
           showToast('Direct call failed — using dashboard relay.', 'warning');
         });
     }
@@ -1168,16 +1201,29 @@
     }
 
     function pollForResult() {
-        if (document.hidden) return;   // save quota when tab is backgrounded
+        if (document.hidden) return;
+        if (!S.csrfNonce) return;
 
         var url = S.relayBase + '?page=scanner-relay' +
                   '&session=' + encodeURIComponent(S.sessionId) +
+                  '&nonce=' + encodeURIComponent(S.csrfNonce) +
                   '&poll_result=1';
 
         fetch(url, { cache: 'no-store' })
             .then(function(res) { return res.json(); })
             .then(function(data) {
                 if (!data) return;
+
+                // Nonce rejected → someone else is using this session
+                if (data.ok === false && data.error === 'INVALID_NONCE') {
+                    stopResultPolling();
+                    stopCamera();
+                    showFatal(
+                        'Session Hijacked',
+                        'Someone else is using this scanner session. Please close this window and start a new scanner from the dashboard.'
+                    );
+                    return;
+                }
 
                 if (data.expired || data.ended) {
                     stopResultPolling();
@@ -1189,6 +1235,11 @@
                             : 'The scan session expired. Close this window and open the scanner again from the dashboard.'
                     );
                     return;
+                }
+
+                // Pick up any nonce rotation from the server
+                if (data.csrfNonce) {
+                    S.csrfNonce = data.csrfNonce;
                 }
 
                 if (data.result) {
@@ -1282,14 +1333,33 @@
     // SESSION LOG
     // ============================================================
     function fetchSessionLog() {
+        if (!S.csrfNonce) return;
+
         var url = S.relayBase + '?page=scanner-relay' +
                   '&session=' + encodeURIComponent(S.sessionId) +
+                  '&nonce=' + encodeURIComponent(S.csrfNonce) +
                   '&poll_log=1';
 
         fetch(url, { cache: 'no-store' })
             .then(function(res) { return res.json(); })
             .then(function(data) {
-                if (!data || !data.ok || !Array.isArray(data.log)) return;
+                if (!data) return;
+
+                if (data.ok === false && data.error === 'INVALID_NONCE') {
+                    stopResultPolling();
+                    stopCamera();
+                    showFatal(
+                        'Session Hijacked',
+                        'Someone else is using this scanner session. Please close this window and start a new scanner from the dashboard.'
+                    );
+                    return;
+                }
+
+                if (data.csrfNonce) {
+                    S.csrfNonce = data.csrfNonce;
+                }
+
+                if (!data.ok || !Array.isArray(data.log)) return;
 
                 // Rebuild in-memory log from history
                 data.log.forEach(function(row) {
@@ -1443,6 +1513,7 @@
         // Tell the backend the session is over
         var url = S.relayBase + '?page=scanner-relay' +
                   '&session=' + encodeURIComponent(S.sessionId) +
+                  '&nonce=' + encodeURIComponent(S.csrfNonce) +
                   '&end_session=1';
 
         fetch(url, { mode: 'no-cors', cache: 'no-store' })
