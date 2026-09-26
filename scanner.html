@@ -620,13 +620,16 @@
         <div class="manual-row">
             <textarea
                 id="manualInput"
-                placeholder="Type or paste codes here, one per line&#10;MISS26-0001&#10;MISS26-0002"
+                placeholder="Type a code and press Enter&#10; Or paste a list (one per line, or comma-separated)&#10;Examples: 7 · 7,8,9 · CH-3"
                 autocapitalize="characters"
                 autocomplete="off"
                 spellcheck="false"></textarea>
             <button class="manual-submit" id="manualSubmit" onclick="submitManual()">
                 <i class="fas fa-check"></i> Validate
             </button>
+        </div>
+        <div id="manualCounter"
+             style="display: none; margin-top: 6px; font-size: 11px; color: #64748b;">
         </div>
         <div class="manual-hint" id="manualHint">
             Type or paste code(s). One per line for batches.
@@ -783,17 +786,58 @@
         // ── Fetch prior log (if this is a resumed session) ──
         fetchSessionLog();
 
-        // ── Handle Enter key on the manual textarea ──
+        // ── Manual entry: Enter submits, Shift+Enter newline ──
         var manualEl = document.getElementById('manualInput');
+
         manualEl.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-                e.preventDefault();
-                submitManual();
+            if (e.key !== 'Enter') return;
+
+            // Shift+Enter → let the default happen (newline)
+            if (e.shiftKey) return;
+
+            // Plain Enter → submit
+            e.preventDefault();
+            submitManual();
+        });
+
+        // ── Live counter for batches ─────────────────────────
+        manualEl.addEventListener('input', function() {
+            var counter = document.getElementById('manualCounter');
+            if (!counter) return;
+
+            var raw = manualEl.value || '';
+            if (!raw.trim()) {
+                counter.style.display = 'none';
+                return;
+            }
+
+            var count = raw
+                .split(/[\n,;]+/)
+                .map(function(s) { return s.trim(); })
+                .filter(function(s) { return s.length > 0; })
+                .length;
+
+            if (count <= 1) {
+                counter.style.display = 'none';
+                return;
+            }
+
+            counter.style.display = 'block';
+
+            if (count > S.maxBatch) {
+                counter.style.color = '#dc2626';
+                counter.textContent = 'Too many: ' + count + ' (max ' + S.maxBatch + ')';
+            } else {
+                counter.style.color = '#64748b';
+                counter.textContent = count + ' code' + (count === 1 ? '' : 's') + ' queued';
             }
         });
+
+        // ── Focus the input on load ──────────────────────────
+        manualEl.focus();
     })();
 
-        // ============================================================
+    // ============================================================
     // TOAST (lightweight, non-blocking)
     // ============================================================
     var _toastTimeout = null;
@@ -1062,6 +1106,8 @@
     // ============================================================
     function submitManual() {
         var el = document.getElementById('manualInput');
+        if (!el) return;
+
         var raw = (el.value || '').trim();
         if (!raw) {
             flashManualHint('Enter a code first.', 'warn');
@@ -1069,7 +1115,7 @@
             return;
         }
 
-        // Split on newlines, commas, semicolons
+        // Split on newlines, commas, semicolons.
         var codes = raw
             .split(/[\n,;]+/)
             .map(function(s) { return s.trim().toUpperCase(); })
@@ -1086,24 +1132,32 @@
             return;
         }
 
+        // ── Clear IMMEDIATELY so officer can type the next
+        //    code while the current one validates. ──
         el.value = '';
+        el.focus();
 
+        // ── Hide the counter (it will reappear on next input) ──
+        var counter = document.getElementById('manualCounter');
+        if (counter) counter.style.display = 'none';
+
+        // ── Single code ───────────────────────────────────────
         if (codes.length === 1) {
-            // Single code — show a processing banner immediately
-            flashManualHint('Validating…', 'ok');
+            flashManualHint('Validating ' + codes[0] + '…', 'ok');
             validateDirect(codes[0], 'manual').then(function() {
-                flashManualHint('Validated.', 'ok');
+                flashManualHint('Ready for next code.', 'ok');
             });
             return;
         }
 
-        // Batch — fire sequentially so results arrive in order
+        // ── Batch — fire sequentially ─────────────────────────
         flashManualHint('Validating ' + codes.length + ' codes…', 'ok');
 
         var i = 0;
         function next() {
             if (i >= codes.length) {
                 flashManualHint('Batch complete (' + codes.length + ' codes).', 'ok');
+                el.focus();
                 return;
             }
             var c = codes[i++];
