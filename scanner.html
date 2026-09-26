@@ -687,7 +687,8 @@
         mode:       'registration',   // 'registration' | 'food'
         maxBatch:   10,
         eventName:  '',
-         csrfNonce:  '',    
+        csrfNonce:  '',    
+        ownerToken: '', 
 
         // ── NEW: race-avoidance flags ──
         _validating:        false,   // true while a POST is in flight
@@ -730,6 +731,7 @@
             S.maxBatch  = parseInt(qs.get('maxBatch'), 10) || 10;
             S.eventName = qs.get('eventName') || '';
             S.csrfNonce = qs.get('nonce') || '';
+            S.ownerToken = qs.get('owner') || '';
         } catch (e) {
             console.error('[boot] could not parse URL:', e);
         }
@@ -1166,7 +1168,8 @@
           code:    code,
           mode:    S.mode,
           session: S.sessionId,
-          nonce:   S.csrfNonce
+          nonce:   S.csrfNonce,
+          ownerToken: S.ownerToken
         }),
         cache: 'no-store'
       })
